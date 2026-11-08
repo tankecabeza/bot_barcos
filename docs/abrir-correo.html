@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enviar Hecho SIGO</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --tx:#1b1f24; --mut:#5c6670; --ac:#1a6ed8; --bd:#d9dee4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171a; --card:#1e2327; --tx:#eef1f4; --mut:#9aa5b1; --ac:#5aa2ff; --bd:#323a42; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--tx); }
+  main { max-width:560px; margin:0 auto; }
+  h1 { font-size:1.2rem; margin:8px 0 12px; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .lbl { color:var(--mut); font-size:.8rem; margin-bottom:2px; }
+  .val { margin-bottom:10px; word-break:break-word; }
+  pre { white-space:pre-wrap; word-break:break-word; margin:0; font:inherit; font-size:.9rem; }
+  .btn { display:block; width:100%; text-align:center; padding:14px; margin-bottom:10px; border-radius:10px;
+         border:1px solid var(--ac); background:var(--ac); color:#fff; font-size:1rem; text-decoration:none; cursor:pointer; }
+  .btn.sec { background:transparent; color:var(--ac); }
+  #err { color:#c0392b; }
+</style>
+</head>
+<body>
+<main>
+  <h1>📧 Enviar Hecho SIGO</h1>
+  <div id="err"></div>
+  <div id="app" hidden>
+    <a id="mailto" class="btn" href="#">Abrir en mi app de correo</a>
+    <a id="gmail" class="btn sec" href="#" target="_blank" rel="noopener">Abrir en Gmail (web)</a>
+    <button id="copiar" class="btn sec" type="button">Copiar asunto y texto</button>
+    <div class="card">
+      <div class="lbl">Para</div><div class="val" id="to"></div>
+      <div class="lbl">Asunto</div><div class="val" id="subj"></div>
+      <div class="lbl">Texto</div><pre id="body"></pre>
+    </div>
+  </div>
+</main>
+<script>
+  function b64urlDecode(s) {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    const bin = atob(s);
+    const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }
+  try {
+    const h = location.hash.replace(/^#d=/, "");
+    if (!h) throw new Error("Falta el contenido del correo en el enlace.");
+    const d = JSON.parse(b64urlDecode(h));
+    const to = String(d.t || ""), subj = String(d.s || ""), body = String(d.b || "");
+
+    document.getElementById("to").textContent = to;
+    document.getElementById("subj").textContent = subj;
+    document.getElementById("body").textContent = body;
+
+    const bodyCRLF = body.replace(/\r?\n/g, "\r\n");
+    const mailto = "mailto:" + encodeURIComponent(to) +
+      "?subject=" + encodeURIComponent(subj) + "&body=" + encodeURIComponent(bodyCRLF);
+    const gmail = "https://mail.google.com/mail/?view=cm&fs=1&to=" + encodeURIComponent(to) +
+      "&su=" + encodeURIComponent(subj) + "&body=" + encodeURIComponent(body);
+
+    document.getElementById("mailto").href = mailto;
+    document.getElementById("gmail").href = gmail;
+    document.getElementById("app").hidden = false;
+
+    document.getElementById("copiar").addEventListener("click", async () => {
+      const txt = "Asunto: " + subj + "\n\n" + body;
+      try { await navigator.clipboard.writeText(txt); }
+      catch (e) {
+        const ta = document.createElement("textarea");
+        ta.value = txt; document.body.appendChild(ta); ta.select();
+        document.execCommand("copy"); ta.remove();
+      }
+      document.getElementById("copiar").textContent = "✅ Copiado";
+    });
+
+    // Intento automático de abrir la app de correo (si el navegador lo bloquea, queda el botón)
+    setTimeout(() => { location.href = mailto; }, 500);
+  } catch (e) {
+    document.getElementById("err").textContent = "No se pudo leer el enlace: " + e.message;
+  }
+</script>
+</body>
+</html>
