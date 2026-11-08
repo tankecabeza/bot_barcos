@@ -4,6 +4,7 @@ import html
 import json
 import time
 import uuid
+import base64
 import sqlite3
 import smtplib
 import threading
@@ -47,16 +48,19 @@ for _v in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-EMAIL_DESTINO = os.environ.get("EMAIL_DESTINO", "aberlanga@guardiacivil.es")
+EMAIL_DESTINO = os.environ.get("EMAIL_DESTINO") or "aberlanga@guardiacivil.es"
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
+MAIL_PAGE_URL = os.environ.get("MAIL_PAGE_URL", "").strip()
 
 WEB_URL = "https://www.puertomalaga.com/es/informacion-atraques/"
 AJAX_URL = "https://www.puertomalaga.com/wp-admin/admin-ajax.php"
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "atraques_malaga_limpio.db")
-TIP_POR_DEFECTO = os.environ.get("TIP_POR_DEFECTO", "F10173Y")
+TIP_POR_DEFECTO = (os.environ.get("TIP_POR_DEFECTO") or "F10173Y").strip().upper()
+# Si vale 1, no pregunta el TIP: usa siempre el predefinido
+TIP_AUTOMATICO = os.environ.get("TIP_AUTOMATICO", "0") == "1"
 INTERVALO_COMPROBACION = 600  # segundos (600 = cada 10 minutos)
 # Opcionales (para ejecutarlo en GitHub Actions por turnos):
 DURACION_MAX_MIN = int(os.environ.get("DURACION_MAX_MIN", "0"))  # 0 = sin límite
@@ -373,6 +377,11 @@ def paso_recibir_fecha_hora(message):
 
     sesiones_sigo[chat_id]["tramo_fecha"] = tramo_fecha
 
+    if TIP_AUTOMATICO:
+        sesiones_sigo[chat_id]["texto_agentes"] = construir_texto_agentes([TIP_POR_DEFECTO])
+        preguntar_actuacion(chat_id, numero="2️⃣")
+        return
+
     markup_tip = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup_tip.add(KeyboardButton(TIP_POR_DEFECTO))
 
@@ -387,34 +396,39 @@ def paso_recibir_fecha_hora(message):
     )
     bot.register_next_step_handler(msg, paso_recibir_tips)
 
-def paso_recibir_tips(message):
-    if _es_comando(message):
-        return
-    chat_id = message.chat.id
-    raw_tips = message.text.replace(",", " ").split()
-    tips = [t.strip().upper() for t in raw_tips if t.strip()]
-
+def construir_texto_agentes(tips):
     if len(tips) == 1:
-        texto_agentes = f"por el agente de la Sección Fiscal del Puerto de Málaga con TIP {tips[0]}"
+        return f"por el agente de la Sección Fiscal del Puerto de Málaga con TIP {tips[0]}"
     elif len(tips) > 1:
         unidos = " y ".join([", ".join(tips[:-1]), tips[-1]])
-        texto_agentes = f"por personal de la Sección Fiscal del Puerto de Málaga con TIP {unidos}"
-    else:
-        texto_agentes = "por personal de la Sección Fiscal del Puerto de Málaga"
+        return f"por personal de la Sección Fiscal del Puerto de Málaga con TIP {unidos}"
+    return "por personal de la Sección Fiscal del Puerto de Málaga"
 
-    sesiones_sigo[chat_id]["texto_agentes"] = texto_agentes
-
+def preguntar_actuacion(chat_id, numero="3️⃣"):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.add(KeyboardButton("Visita de entrada e inspección de documentación"))
     markup.add(KeyboardButton("Avistamiento e inspección de documentación"))
 
     msg = bot.send_message(
         chat_id,
-        "3️⃣ <b>TIPO DE ACTUACIÓN:</b>\nPulsa una opción del teclado:",
+        f"{numero} <b>TIPO DE ACTUACIÓN:</b>\nPulsa una opción del teclado:",
         parse_mode="HTML",
         reply_markup=markup
     )
     bot.register_next_step_handler(msg, paso_recibir_actuacion)
+
+def paso_recibir_tips(message):
+    if _es_comando(message):
+        return
+    chat_id = message.chat.id
+    if chat_id not in sesiones_sigo:
+        bot.send_message(chat_id, "❌ La sesión ha expirado. Vuelve a pulsar el botón del barco.",
+                         reply_markup=ReplyKeyboardRemove())
+        return
+    raw_tips = message.text.replace(",", " ").split()
+    tips = [t.strip().upper() for t in raw_tips if t.strip()]
+    sesiones_sigo[chat_id]["texto_agentes"] = construir_texto_agentes(tips)
+    preguntar_actuacion(chat_id)
 
 def paso_recibir_actuacion(message):
     if _es_comando(message):
@@ -459,7 +473,11 @@ def generar_hecho_sigo(chat_id):
     correos_pendientes[token] = {"asunto": asunto_mail, "cuerpo": texto_sigo}
 
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton(f"📧 Enviar a {EMAIL_DESTINO}", callback_data=f"mail_{token}"))
+    url_correo = construir_url_correo(asunto_mail, texto_sigo)
+    if url_correo:
+        markup.add(InlineKeyboardButton("✉️ Abrir en mi correo (ya redactado)", url=url_correo))
+    if SMTP_USER and SMTP_PASS:
+        markup.add(InlineKeyboardButton(f"📧 Enviar directo a {EMAIL_DESTINO}", callback_data=f"mail_{token}"))
 
     bot.send_message(
         chat_id,
@@ -468,9 +486,20 @@ def generar_hecho_sigo(chat_id):
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
-    bot.send_message(chat_id, "¿Lo envío por correo ahora?", reply_markup=markup)
+    if markup.keyboard:
+        bot.send_message(chat_id, "¿Cómo lo envías?", reply_markup=markup)
 
     sesiones_sigo.pop(chat_id, None)
+
+def construir_url_correo(asunto, cuerpo):
+    """Enlace a la página de GitHub Pages que abre tu correo con todo redactado.
+    Los datos van en el fragmento (#), que no se envía a ningún servidor."""
+    if not MAIL_PAGE_URL:
+        return None
+    payload = json.dumps({"t": EMAIL_DESTINO, "s": asunto, "b": cuerpo}, ensure_ascii=False)
+    codigo = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    url = f"{MAIL_PAGE_URL}#d={codigo}"
+    return url if len(url) <= 2000 else None  # límite prudente para botones de Telegram
 
 # ==============================================================================
 # 6. ENVÍO DIRECTO DE CORREO (SMTP) - sustituye al enlace mailto que llegaba vacío
