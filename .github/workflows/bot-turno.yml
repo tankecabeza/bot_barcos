@@ -34,7 +34,7 @@ jobs:
 
   tramo2:
     needs: tramo1
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 358
     steps:
