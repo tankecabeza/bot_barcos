@@ -26,6 +26,25 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==============================================================================
 # CONFIGURACIÓN (desde variables de entorno, NO escribas claves en el código)
 # ==============================================================================
+def _cargar_env():
+    """Lee el archivo .env (junto a este script) y lo vuelca en las variables de entorno."""
+    ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(ruta):
+        return
+    with open(ruta, encoding="utf-8-sig") as f:
+        for linea in f:
+            linea = linea.strip()
+            if not linea or linea.startswith("#") or "=" not in linea:
+                continue
+            clave, valor = linea.split("=", 1)
+            os.environ.setdefault(clave.strip(), valor.strip().strip('"').strip("'"))
+
+_cargar_env()
+
+for _v in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
+    if not os.environ.get(_v):
+        raise SystemExit(f"Falta {_v}. Crea un archivo .env junto a bot.py (mira .env.example).")
+
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 EMAIL_DESTINO = os.environ.get("EMAIL_DESTINO", "aberlanga@guardiacivil.es")
@@ -39,6 +58,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "atraques_malaga_limpio.db")
 TIP_POR_DEFECTO = os.environ.get("TIP_POR_DEFECTO", "F10173Y")
 INTERVALO_COMPROBACION = 600  # segundos (600 = cada 10 minutos)
+# Opcionales (para ejecutarlo en GitHub Actions por turnos):
+DURACION_MAX_MIN = int(os.environ.get("DURACION_MAX_MIN", "0"))  # 0 = sin límite
+PRIMERA_PASADA_SILENCIOSA = os.environ.get("PRIMERA_PASADA_SILENCIOSA", "0") == "1"
 
 # Los servidores en la nube van en UTC: forzamos hora de Madrid
 TZ = ZoneInfo("Europe/Madrid")
@@ -492,22 +514,40 @@ def callback_enviar_correo(call):
 # ==============================================================================
 def bucle_vigilancia_puerto():
     logging.info("Hilo de vigilancia portuaria iniciado...")
+    primera_pasada = PRIMERA_PASADA_SILENCIOSA
     while True:
         try:
             barcos = extraer_barcos_puerto()
             for b in barcos:
                 if not barco_ya_registrado(b["buque"], b["entrada"], b["muelle"]):
                     b_id = guardar_barco_bd(b)
+                    if primera_pasada:
+                        # Arranque en un servidor sin base de datos previa: se registran
+                        # los barcos que ya estaban sin avisar, para no inundar el chat.
+                        continue
                     logging.info(f"Nuevo barco detectado y registrado: {b['buque']} ({b['entrada']})")
                     enviar_alerta_nuevo_barco(b_id, b)
+            primera_pasada = False
         except Exception as e:
             logging.error(f"Error en bucle de vigilancia: {e}")
         time.sleep(INTERVALO_COMPROBACION)
+
+def _apagar():
+    logging.info("Duración máxima alcanzada: cerrando el bot limpiamente.")
+    try:
+        bot.stop_polling()
+    finally:
+        os._exit(0)
 
 if __name__ == "__main__":
     inicializar_bd()
     configurar_menu_bot()
     threading.Thread(target=bucle_vigilancia_puerto, daemon=True).start()
+    if DURACION_MAX_MIN > 0:
+        t = threading.Timer(DURACION_MAX_MIN * 60, _apagar)
+        t.daemon = True
+        t.start()
+        logging.info(f"El bot se cerrará solo en {DURACION_MAX_MIN} minutos.")
 
     logging.info("Bot de Telegram conectado y escuchando...")
     bot.infinity_polling()
