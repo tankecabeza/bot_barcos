@@ -318,8 +318,43 @@ def cmd_manana(message):
     listar_barcos(message.chat.id, (ahora() + timedelta(days=1)).strftime("%d/%m/%Y"))
 
 # ==============================================================================
-# 5. ASISTENTE INTERACTIVO HECHO SIGO
+# 5. ASISTENTE INTERACTIVO HECHO SIGO (botones bajo el mensaje, siempre visibles)
+#    En cada paso puedes pulsar el botón o escribir el dato a mano.
 # ==============================================================================
+ACTUACIONES = {
+    "vis": "Visita de entrada e inspección de documentación",
+    "avi": "Avistamiento e inspección de documentación",
+}
+
+def _quitar_botones(call):
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
+def _es_comando(message):
+    """Si el usuario escribe un /comando en mitad del asistente, lo cancelamos."""
+    if message.text and message.text.startswith("/"):
+        sesiones_sigo.pop(message.chat.id, None)
+        bot.clear_step_handler_by_chat_id(message.chat.id)
+        bot.send_message(message.chat.id, "❌ Asistente cancelado. Vuelve a enviar el comando.")
+        return True
+    return False
+
+def _sin_sesion(chat_id):
+    bot.send_message(chat_id, "❌ La sesión ha expirado. Vuelve a pulsar el botón del barco.")
+
+def _texto_o_repetir(message, siguiente_handler):
+    """Devuelve el texto escrito, o None (y vuelve a esperar) si no es texto."""
+    if _es_comando(message):
+        return None
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "Escribe el dato como texto, por favor.")
+        bot.register_next_step_handler(msg, siguiente_handler)
+        return None
+    return message.text.strip()
+
+# ---------- Paso 1: fecha y hora ----------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sigo_"))
 def iniciar_asistente_sigo(call):
     barco_id = int(call.data.split("_")[1])
@@ -331,41 +366,55 @@ def iniciar_asistente_sigo(call):
 
     bot.answer_callback_query(call.id)
     chat_id = call.message.chat.id
-    sesiones_sigo[chat_id] = {"barco": datos_barco}
+    bot.clear_step_handler_by_chat_id(chat_id)
 
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add(KeyboardButton(ahora().strftime("HOY a las %H:%M")))
+    hora_ahora = ahora().strftime("%H:%M")
+    sesion = {"barco": datos_barco, "hora_ahora": hora_ahora, "hora_web": None}
+    sesiones_sigo[chat_id] = sesion
 
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(f"🕒 HOY a las {hora_ahora} (ahora)", callback_data="f_ahora"))
     if "a las " in datos_barco["entrada"]:
         hora_web = datos_barco["entrada"].split("a las ")[-1].strip()
-        markup.add(KeyboardButton(f"HOY a las {hora_web}"))
+        if hora_web:
+            sesion["hora_web"] = hora_web
+            markup.add(InlineKeyboardButton(f"🕒 HOY a las {hora_web} (hora de la web)", callback_data="f_web"))
 
     msg = bot.send_message(
         chat_id,
-        f"📝 <b>Iniciando Hecho SIGO para el buque {html.escape(datos_barco['buque'])}</b>\n\n"
-        f"1️⃣ <b>FECHA Y HORA:</b> Pulsa un botón rápido o escríbela a mano:\n"
-        f"• Si es de hoy, escribe solo la hora (ej: <code>05:45</code> o <code>13:30</code>)\n"
-        f"• Si es de otro día, escribe hora y fecha (ej: <code>10:30 horas del día 22 de Noviembre de 2026</code>)\n\n"
+        f"📝 <b>Hecho SIGO del buque {html.escape(datos_barco['buque'])}</b>\n\n"
+        f"1️⃣ <b>FECHA Y HORA:</b> pulsa un botón o escribe la hora a mano:\n"
+        f"• Si es de hoy, solo la hora (ej: <code>05:45</code>)\n"
+        f"• Si es de otro día: <code>10:30 horas del día 22 de Noviembre de 2026</code>\n\n"
         f"(/cancelar para salir)",
         parse_mode="HTML",
         reply_markup=markup
     )
     bot.register_next_step_handler(msg, paso_recibir_fecha_hora)
 
-def _es_comando(message):
-    """Si el usuario escribe un /comando en mitad del asistente, lo cancelamos."""
-    if message.text and message.text.startswith("/"):
-        sesiones_sigo.pop(message.chat.id, None)
-        bot.send_message(message.chat.id, "❌ Asistente cancelado. Vuelve a enviar el comando.",
-                         reply_markup=ReplyKeyboardRemove())
-        return True
-    return False
+@bot.callback_query_handler(func=lambda call: call.data in ("f_ahora", "f_web"))
+def cb_fecha(call):
+    chat_id = call.message.chat.id
+    sesion = sesiones_sigo.get(chat_id)
+    if not sesion:
+        bot.answer_callback_query(call.id, "La sesión ha expirado. Vuelve a pulsar el botón del barco.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    _quitar_botones(call)
+    bot.clear_step_handler_by_chat_id(chat_id)
+    hora = sesion["hora_ahora"] if call.data == "f_ahora" else (sesion["hora_web"] or sesion["hora_ahora"])
+    procesar_fecha_hora(chat_id, f"HOY a las {hora}")
 
 def paso_recibir_fecha_hora(message):
-    if _es_comando(message):
+    texto = _texto_o_repetir(message, paso_recibir_fecha_hora)
+    if texto is None:
         return
-    chat_id = message.chat.id
-    texto = message.text.strip()
+    procesar_fecha_hora(message.chat.id, texto)
+
+def procesar_fecha_hora(chat_id, texto):
+    if chat_id not in sesiones_sigo:
+        _sin_sesion(chat_id)
+        return
 
     if texto.startswith("HOY a las"):
         hora = texto.replace("HOY a las ", "").strip()
@@ -380,22 +429,10 @@ def paso_recibir_fecha_hora(message):
     if TIP_AUTOMATICO:
         sesiones_sigo[chat_id]["texto_agentes"] = construir_texto_agentes([TIP_POR_DEFECTO])
         preguntar_actuacion(chat_id, numero="2️⃣")
-        return
+    else:
+        preguntar_tip(chat_id)
 
-    markup_tip = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup_tip.add(KeyboardButton(TIP_POR_DEFECTO))
-
-    msg = bot.send_message(
-        chat_id,
-        "2️⃣ <b>TIP DE LOS AGENTES:</b>\n"
-        f"Pulsa el botón <code>{TIP_POR_DEFECTO}</code> o escribe otro(s) "
-        "(si son varios, sepáralos por coma o espacio).\n"
-        "Ejemplo: <code>B36491-I L29418N</code>",
-        parse_mode="HTML",
-        reply_markup=markup_tip
-    )
-    bot.register_next_step_handler(msg, paso_recibir_tips)
-
+# ---------- Paso 2: TIP ----------
 def construir_texto_agentes(tips):
     if len(tips) == 1:
         return f"por el agente de la Sección Fiscal del Puerto de Málaga con TIP {tips[0]}"
@@ -404,48 +441,89 @@ def construir_texto_agentes(tips):
         return f"por personal de la Sección Fiscal del Puerto de Málaga con TIP {unidos}"
     return "por personal de la Sección Fiscal del Puerto de Málaga"
 
-def preguntar_actuacion(chat_id, numero="3️⃣"):
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add(KeyboardButton("Visita de entrada e inspección de documentación"))
-    markup.add(KeyboardButton("Avistamiento e inspección de documentación"))
-
+def preguntar_tip(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(f"✅ Usar {TIP_POR_DEFECTO}", callback_data="t_def"))
     msg = bot.send_message(
         chat_id,
-        f"{numero} <b>TIPO DE ACTUACIÓN:</b>\nPulsa una opción del teclado:",
+        f"2️⃣ <b>TIP DE LOS AGENTES:</b>\n"
+        f"Pulsa el botón para usar <code>{html.escape(TIP_POR_DEFECTO)}</code>, o escribe otro(s) "
+        f"(si son varios, sepáralos por coma o espacio).\n"
+        f"Ejemplo: <code>B36491-I L29418N</code>",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(msg, paso_recibir_tips)
+
+@bot.callback_query_handler(func=lambda call: call.data == "t_def")
+def cb_tip(call):
+    chat_id = call.message.chat.id
+    if chat_id not in sesiones_sigo:
+        bot.answer_callback_query(call.id, "La sesión ha expirado. Vuelve a pulsar el botón del barco.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    _quitar_botones(call)
+    bot.clear_step_handler_by_chat_id(chat_id)
+    procesar_tips(chat_id, TIP_POR_DEFECTO)
+
+def paso_recibir_tips(message):
+    texto = _texto_o_repetir(message, paso_recibir_tips)
+    if texto is None:
+        return
+    procesar_tips(message.chat.id, texto)
+
+def procesar_tips(chat_id, texto):
+    if chat_id not in sesiones_sigo:
+        _sin_sesion(chat_id)
+        return
+    tips = [t.strip().upper() for t in texto.replace(",", " ").split() if t.strip()]
+    sesiones_sigo[chat_id]["texto_agentes"] = construir_texto_agentes(tips)
+    preguntar_actuacion(chat_id)
+
+# ---------- Paso 3: tipo de actuación ----------
+def preguntar_actuacion(chat_id, numero="3️⃣"):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Visita de entrada", callback_data="a_vis"))
+    markup.add(InlineKeyboardButton("Avistamiento", callback_data="a_avi"))
+    msg = bot.send_message(
+        chat_id,
+        f"{numero} <b>TIPO DE ACTUACIÓN:</b>\n"
+        f"• <b>Visita de entrada</b>: {ACTUACIONES['vis']}\n"
+        f"• <b>Avistamiento</b>: {ACTUACIONES['avi']}\n\n"
+        f"Pulsa una opción (o escribe otra a mano).",
         parse_mode="HTML",
         reply_markup=markup
     )
     bot.register_next_step_handler(msg, paso_recibir_actuacion)
 
-def paso_recibir_tips(message):
-    if _es_comando(message):
-        return
-    chat_id = message.chat.id
+@bot.callback_query_handler(func=lambda call: call.data in ("a_vis", "a_avi"))
+def cb_actuacion(call):
+    chat_id = call.message.chat.id
     if chat_id not in sesiones_sigo:
-        bot.send_message(chat_id, "❌ La sesión ha expirado. Vuelve a pulsar el botón del barco.",
-                         reply_markup=ReplyKeyboardRemove())
+        bot.answer_callback_query(call.id, "La sesión ha expirado. Vuelve a pulsar el botón del barco.", show_alert=True)
         return
-    raw_tips = message.text.replace(",", " ").split()
-    tips = [t.strip().upper() for t in raw_tips if t.strip()]
-    sesiones_sigo[chat_id]["texto_agentes"] = construir_texto_agentes(tips)
-    preguntar_actuacion(chat_id)
+    bot.answer_callback_query(call.id)
+    _quitar_botones(call)
+    bot.clear_step_handler_by_chat_id(chat_id)
+    procesar_actuacion(chat_id, ACTUACIONES[call.data.split("_")[1]])
 
 def paso_recibir_actuacion(message):
-    if _es_comando(message):
+    texto = _texto_o_repetir(message, paso_recibir_actuacion)
+    if texto is None:
         return
-    chat_id = message.chat.id
+    procesar_actuacion(message.chat.id, texto)
+
+def procesar_actuacion(chat_id, texto):
     if chat_id not in sesiones_sigo:
-        bot.send_message(chat_id, "❌ La sesión ha expirado. Vuelve a pulsar el botón del barco.",
-                         reply_markup=ReplyKeyboardRemove())
+        _sin_sesion(chat_id)
         return
-    sesiones_sigo[chat_id]["actuacion"] = message.text.strip().lower()
+    sesiones_sigo[chat_id]["actuacion"] = texto.strip().lower()
     generar_hecho_sigo(chat_id)
 
 def generar_hecho_sigo(chat_id):
     datos = sesiones_sigo.get(chat_id)
     if not datos:
-        bot.send_message(chat_id, "❌ La sesión ha expirado. Vuelve a pulsar el botón del barco.",
-                         reply_markup=ReplyKeyboardRemove())
+        _sin_sesion(chat_id)
         return
 
     b = datos["barco"]
@@ -483,8 +561,7 @@ def generar_hecho_sigo(chat_id):
         chat_id,
         f"✅ <b>HECHO SIGO GENERADO</b> (toca el texto para copiarlo):\n\n"
         f"<pre>{html.escape(texto_sigo)}</pre>",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
+        parse_mode="HTML"
     )
     if markup.keyboard:
         bot.send_message(chat_id, "¿Cómo lo envías?", reply_markup=markup)
