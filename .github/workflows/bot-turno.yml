@@ -14,7 +14,9 @@ env:
   EMAIL_DESTINO: ${{ secrets.EMAIL_DESTINO }}
   SMTP_USER: ${{ secrets.SMTP_USER }}
   SMTP_PASS: ${{ secrets.SMTP_PASS }}
-  TIP_POR_DEFECTO: ${{ secrets.TIP_POR_DEFECTO }}
+  TIP_POR_DEFECTO: F10173Y
+  TIP_AUTOMATICO: "0"
+  MAIL_PAGE_URL: ${{ secrets.MAIL_PAGE_URL }}
   PRIMERA_PASADA_SILENCIOSA: "1"
   DURACION_MAX_MIN: "350"   # el bot se apaga solo a las 5 h 50 min (límite de GitHub: 6 h por job)
 
