@@ -10,9 +10,10 @@ import smtplib
 import threading
 import logging
 import urllib3
+from urllib.parse import quote, urlencode
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 import telebot
@@ -25,10 +26,10 @@ from telebot.types import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
-# CONFIGURACIÓN (desde variables de entorno, NO escribas claves en el código)
+# CONFIGURACIÓN (desde GitHub Actions Secrets / variables de entorno o .env local)
 # ==============================================================================
 def _cargar_env():
-    """Lee el archivo .env (junto a este script) y lo vuelca en las variables de entorno."""
+    """Lee el archivo .env (si se ejecuta en local) y lo vuelca en os.environ."""
     ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(ruta):
         return
@@ -44,29 +45,32 @@ _cargar_env()
 
 for _v in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
     if not os.environ.get(_v):
-        raise SystemExit(f"Falta {_v}. Crea un archivo .env junto a bot.py (mira .env.example).")
+        raise SystemExit(f"Falta {_v}. Configúralo en GitHub Secrets o en un archivo .env local.")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 EMAIL_DESTINO = os.environ.get("EMAIL_DESTINO") or "aberlanga@guardiacivil.es"
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
 MAIL_PAGE_URL = os.environ.get("MAIL_PAGE_URL", "").strip()
 
 WEB_URL = "https://www.puertomalaga.com/es/informacion-atraques/"
 AJAX_URL = "https://www.puertomalaga.com/wp-admin/admin-ajax.php"
+MAPA_PUERTO_URL = "https://www.vesselfinder.com/?lat=36.7145&lon=-4.4173&zoom=15"
+
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "atraques_malaga_limpio.db")
+
 TIP_POR_DEFECTO = (os.environ.get("TIP_POR_DEFECTO") or "F10173Y").strip().upper()
-# Si vale 1, no pregunta el TIP: usa siempre el predefinido
 TIP_AUTOMATICO = os.environ.get("TIP_AUTOMATICO", "0") == "1"
 INTERVALO_COMPROBACION = 600  # segundos (600 = cada 10 minutos)
-# Opcionales (para ejecutarlo en GitHub Actions por turnos):
+
+# Control para turnos en GitHub Actions (ej: 350 min por tramo)
 DURACION_MAX_MIN = int(os.environ.get("DURACION_MAX_MIN", "0"))  # 0 = sin límite
 PRIMERA_PASADA_SILENCIOSA = os.environ.get("PRIMERA_PASADA_SILENCIOSA", "0") == "1"
 
-# Los servidores en la nube van en UTC: forzamos hora de Madrid
+# Los servidores de GitHub van en UTC: forzamos hora de Madrid
 TZ = ZoneInfo("Europe/Madrid")
 
 def ahora():
@@ -76,7 +80,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 sesiones_sigo = {}
-correos_pendientes = {}  # token -> {"asunto":..., "cuerpo":...}
+correos_pendientes = {}  # token -> {"asunto":..., "cuerpo":..., "buque":...}
 
 # ==============================================================================
 # 0. MENÚ DE COMANDOS DEL BOT (el botón "Menú" junto al cuadro de texto)
@@ -198,6 +202,9 @@ def extraer_barcos_puerto(fecha_str=None):
             if not isinstance(fila, list) or len(fila) < 6:
                 continue
 
+            if len(fila) == 3 and all(str(x).isdigit() for x in fila):
+                continue
+
             col_buque = limpiar_celda(fila[0])
             buque = col_buque[0].upper() if len(col_buque) > 0 else "DESCONOCIDO"
             bandera = col_buque[1].upper() if len(col_buque) > 1 else "DESCONOCIDA"
@@ -219,7 +226,7 @@ def extraer_barcos_puerto(fecha_str=None):
             procedencia = col_ruta[0].upper() if len(col_ruta) > 0 else "DESCONOCIDO"
             destino = col_ruta[1].upper() if len(col_ruta) > 1 else (col_ruta[0].upper() if len(col_ruta) == 1 else "DESCONOCIDO")
 
-            url_vf = f"https://www.vesselfinder.com/vessels?name={buque.replace(' ', '%20')}"
+            url_vf = f"https://www.vesselfinder.com/vessels?name={quote(buque)}"
 
             lista_barcos.append({
                 "buque": buque, "bandera": bandera, "gt": gt, "eslora": eslora,
@@ -234,7 +241,7 @@ def extraer_barcos_puerto(fecha_str=None):
     return lista_barcos
 
 # ==============================================================================
-# 3. NOTIFICACIÓN DE BARCO EN TELEGRAM
+# 3. NOTIFICACIÓN DE BARCO EN TELEGRAM (CON LAS 3 OPCIONES EN BOTONES)
 # ==============================================================================
 def enviar_alerta_nuevo_barco(barco_id, datos, chat_id=TELEGRAM_CHAT_ID):
     texto = (
@@ -247,11 +254,15 @@ def enviar_alerta_nuevo_barco(barco_id, datos, chat_id=TELEGRAM_CHAT_ID):
         f"🕒 <b>Entrada:</b> {html.escape(datos['entrada'])}\n"
         f"⚓ <b>Muelle:</b> {html.escape(datos['muelle'])}\n"
         f"🧭 <b>Origen:</b> {html.escape(datos['procedencia'])}\n"
-        f"🎯 <b>Destino:</b> {html.escape(datos['destino'])}\n\n"
-        f"🛰️ <a href=\"{datos['vesselfinder_url']}\">Contrastado en VesselFinder (Ver Mapa)</a>"
+        f"🎯 <b>Destino:</b> {html.escape(datos['destino'])}"
     )
 
-    markup = InlineKeyboardMarkup()
+    markup = InlineKeyboardMarkup(row_width=1)
+    # 1. Ver información del buque en VesselFinder
+    markup.add(InlineKeyboardButton("🔎 Ver información en VesselFinder", url=datos["vesselfinder_url"]))
+    # 2. Ver el mapa en vivo centrado directamente en el Puerto de Málaga
+    markup.add(InlineKeyboardButton("🗺️ Ver mapa del puerto en vivo", url=MAPA_PUERTO_URL))
+    # 3. Crear Hecho SIGO
     markup.add(InlineKeyboardButton("📝 Generar Hecho SIGO", callback_data=f"sigo_{barco_id}"))
 
     try:
@@ -309,12 +320,10 @@ def cmd_barcos(message):
 
 @bot.message_handler(commands=["ayer"])
 def cmd_ayer(message):
-    from datetime import timedelta
     listar_barcos(message.chat.id, (ahora() - timedelta(days=1)).strftime("%d/%m/%Y"))
 
 @bot.message_handler(commands=["manana"])
 def cmd_manana(message):
-    from datetime import timedelta
     listar_barcos(message.chat.id, (ahora() + timedelta(days=1)).strftime("%d/%m/%Y"))
 
 # ==============================================================================
@@ -322,8 +331,8 @@ def cmd_manana(message):
 #    En cada paso puedes pulsar el botón o escribir el dato a mano.
 # ==============================================================================
 ACTUACIONES = {
-    "vis": "Visita de entrada e inspección de documentación",
-    "avi": "Avistamiento e inspección de documentación",
+    "vis": "visita de entrada e inspección de documentación",
+    "avi": "avistamiento e inspección de documentación",
 }
 
 def _quitar_botones(call):
@@ -482,15 +491,15 @@ def procesar_tips(chat_id, texto):
 
 # ---------- Paso 3: tipo de actuación ----------
 def preguntar_actuacion(chat_id, numero="3️⃣"):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Visita de entrada", callback_data="a_vis"))
-    markup.add(InlineKeyboardButton("Avistamiento", callback_data="a_avi"))
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📋 Visita de entrada e inspección", callback_data="a_vis"),
+        InlineKeyboardButton("🔭 Avistamiento e inspección", callback_data="a_avi"),
+    )
     msg = bot.send_message(
         chat_id,
         f"{numero} <b>TIPO DE ACTUACIÓN:</b>\n"
-        f"• <b>Visita de entrada</b>: {ACTUACIONES['vis']}\n"
-        f"• <b>Avistamiento</b>: {ACTUACIONES['avi']}\n\n"
-        f"Pulsa una opción (o escribe otra a mano).",
+        f"Pulsa una opción o escribe el texto a mano:",
         parse_mode="HTML",
         reply_markup=markup
     )
@@ -505,35 +514,174 @@ def cb_actuacion(call):
     bot.answer_callback_query(call.id)
     _quitar_botones(call)
     bot.clear_step_handler_by_chat_id(chat_id)
-    procesar_actuacion(chat_id, ACTUACIONES[call.data.split("_")[1]])
+    clave = call.data.split("_")[1]
+    procesar_actuacion(chat_id, ACTUACIONES[clave])
 
 def paso_recibir_actuacion(message):
     texto = _texto_o_repetir(message, paso_recibir_actuacion)
     if texto is None:
         return
-    procesar_actuacion(message.chat.id, texto)
+    procesar_actuacion(message.chat.id, texto.lower())
 
-def procesar_actuacion(chat_id, texto):
+def procesar_actuacion(chat_id, actuacion):
     if chat_id not in sesiones_sigo:
         _sin_sesion(chat_id)
         return
-    sesiones_sigo[chat_id]["actuacion"] = texto.strip().lower()
-    generar_hecho_sigo(chat_id)
+    sesiones_sigo[chat_id]["actuacion"] = actuacion
+    preguntar_procedencia(chat_id)
 
-def generar_hecho_sigo(chat_id):
-    datos = sesiones_sigo.get(chat_id)
+# ---------- Paso 4: procedencia ----------
+def preguntar_procedencia(chat_id):
+    b = sesiones_sigo[chat_id]["barco"]
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(f"✅ {b['procedencia']}", callback_data="p_web"))
+    msg = bot.send_message(
+        chat_id,
+        f"4️⃣ <b>PROCEDENCIA (Puerto anterior):</b>\n"
+        f"Pulsa el botón para confirmar <code>{html.escape(b['procedencia'])}</code> o escríbelo a mano:",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(msg, paso_recibir_procedencia)
+
+@bot.callback_query_handler(func=lambda call: call.data == "p_web")
+def cb_procedencia(call):
+    chat_id = call.message.chat.id
+    if chat_id not in sesiones_sigo:
+        bot.answer_callback_query(call.id, "La sesión ha expirado.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    _quitar_botones(call)
+    bot.clear_step_handler_by_chat_id(chat_id)
+    procesar_procedencia(chat_id, sesiones_sigo[chat_id]["barco"]["procedencia"])
+
+def paso_recibir_procedencia(message):
+    texto = _texto_o_repetir(message, paso_recibir_procedencia)
+    if texto is None:
+        return
+    procesar_procedencia(message.chat.id, texto)
+
+def procesar_procedencia(chat_id, procedencia):
+    if chat_id not in sesiones_sigo:
+        _sin_sesion(chat_id)
+        return
+    sesiones_sigo[chat_id]["procedencia"] = procedencia.strip().upper()
+    preguntar_destino(chat_id)
+
+# ---------- Paso 5: destino ----------
+def preguntar_destino(chat_id):
+    b = sesiones_sigo[chat_id]["barco"]
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(f"✅ {b['destino']}", callback_data="d_web"))
+    msg = bot.send_message(
+        chat_id,
+        f"5️⃣ <b>DESTINO (Próximo puerto):</b>\n"
+        f"Pulsa el botón para confirmar <code>{html.escape(b['destino'])}</code> o escríbelo a mano:",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(msg, paso_recibir_destino)
+
+@bot.callback_query_handler(func=lambda call: call.data == "d_web")
+def cb_destino(call):
+    chat_id = call.message.chat.id
+    if chat_id not in sesiones_sigo:
+        bot.answer_callback_query(call.id, "La sesión ha expirado.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    _quitar_botones(call)
+    bot.clear_step_handler_by_chat_id(chat_id)
+    procesar_destino(chat_id, sesiones_sigo[chat_id]["barco"]["destino"])
+
+def paso_recibir_destino(message):
+    texto = _texto_o_repetir(message, paso_recibir_destino)
+    if texto is None:
+        return
+    procesar_destino(message.chat.id, texto)
+
+def procesar_destino(chat_id, destino):
+    if chat_id not in sesiones_sigo:
+        _sin_sesion(chat_id)
+        return
+    sesiones_sigo[chat_id]["destino"] = destino.strip().upper()
+    preguntar_muelle(chat_id)
+
+# ---------- Paso 6: muelle de atraque y generación final ----------
+MUELLE_OPCIONES = {
+    "m_2": "muelle 2",
+    "m_91": "muelle 9.1",
+    "m_ln": "muelle levante NORTE",
+    "m_an": "muelle AMADEA ATRAQUE NORTE",
+}
+
+def _formatear_muelle(m):
+    m = m.strip()
+    return m if m.lower().startswith("muelle") else f"muelle {m}"
+
+def preguntar_muelle(chat_id):
+    b = sesiones_sigo[chat_id]["barco"]
+    m_web = _formatear_muelle(b["muelle"])
+    sesiones_sigo[chat_id]["muelle_web"] = m_web
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton(f"✅ {m_web} (Web)", callback_data="m_web"))
+    markup.add(
+        InlineKeyboardButton("muelle 2", callback_data="m_2"),
+        InlineKeyboardButton("muelle 9.1", callback_data="m_91"),
+        InlineKeyboardButton("levante NORTE", callback_data="m_ln"),
+        InlineKeyboardButton("AMADEA NORTE", callback_data="m_an"),
+    )
+    msg = bot.send_message(
+        chat_id,
+        f"6️⃣ <b>MUELLE DE ATRAQUE:</b>\n"
+        f"Pulsa el muelle detectado (<code>{html.escape(m_web)}</code>), uno habitual, o escríbelo a mano:",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(msg, paso_recibir_muelle)
+
+@bot.callback_query_handler(func=lambda call: call.data in ("m_web", "m_2", "m_91", "m_ln", "m_an"))
+def cb_muelle(call):
+    chat_id = call.message.chat.id
+    if chat_id not in sesiones_sigo:
+        bot.answer_callback_query(call.id, "La sesión ha expirado.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    _quitar_botones(call)
+    bot.clear_step_handler_by_chat_id(chat_id)
+    if call.data == "m_web":
+        muelle = sesiones_sigo[chat_id].get("muelle_web") or _formatear_muelle(sesiones_sigo[chat_id]["barco"]["muelle"])
+    else:
+        muelle = MUELLE_OPCIONES[call.data]
+    finalizar_sigo(chat_id, muelle)
+
+def paso_recibir_muelle(message):
+    texto = _texto_o_repetir(message, paso_recibir_muelle)
+    if texto is None:
+        return
+    finalizar_sigo(message.chat.id, _formatear_muelle(texto))
+
+def _construir_url_pagina_correo(destinatario, asunto, cuerpo):
+    """Construye el enlace hacia docs/abrir-correo.html pasando datos en URL y Base64."""
+    b64_subject = base64.urlsafe_b64encode(asunto.encode("utf-8")).decode("ascii")
+    b64_body = base64.urlsafe_b64encode(cuerpo.encode("utf-8")).decode("ascii")
+    params = urlencode({
+        "to": destinatario,
+        "subject": asunto,
+        "body": cuerpo,
+        "s64": b64_subject,
+        "b64": b64_body,
+    })
+    sep = "&" if "?" in MAIL_PAGE_URL else "?"
+    return f"{MAIL_PAGE_URL}{sep}{params}"
+
+def finalizar_sigo(chat_id, muelle):
+    datos = sesiones_sigo.pop(chat_id, None)
     if not datos:
         _sin_sesion(chat_id)
         return
 
     b = datos["barco"]
-    # Procedencia, destino y muelle se toman directamente de la web (sin confirmar)
-    procedencia = b["procedencia"]
-    destino = b["destino"]
-    muelle = b["muelle"]
-    if not muelle.lower().startswith("muelle"):
-        muelle = f"muelle {muelle}"
-
     titulo_actuacion = datos["actuacion"].upper()
 
     texto_sigo = (
@@ -542,118 +690,121 @@ def generar_hecho_sigo(chat_id):
         f"Descripción:\n\n"
         f"{datos['tramo_fecha']}, {datos['texto_agentes']}, se realiza la {datos['actuacion']} "
         f"del buque “{b['buque']}” con bandera de {b['bandera']}, consignado por {b['consignatario']}, "
-        f"procedente de {procedencia} y con destino a {destino}. "
+        f"procedente de {datos['procedencia']} y con destino a {datos['destino']}. "
         f"Quedando atracado en el {muelle} de este recinto portuario."
     )
 
-    asunto_mail = f"HECHO SIGO - H080340 - BUQUE {b['buque']}"
-    token = uuid.uuid4().hex[:10]
-    correos_pendientes[token] = {"asunto": asunto_mail, "cuerpo": texto_sigo}
+    asunto = f"HECHO SIGO - H080340 - BUQUE {b['buque']}"
+    token = uuid.uuid4().hex[:12]
+    correos_pendientes[token] = {"asunto": asunto, "cuerpo": texto_sigo, "buque": b["buque"]}
 
-    markup = InlineKeyboardMarkup()
-    url_correo = construir_url_correo(asunto_mail, texto_sigo)
-    if url_correo:
-        markup.add(InlineKeyboardButton("✉️ Abrir en mi correo (ya redactado)", url=url_correo))
+    markup = InlineKeyboardMarkup(row_width=1)
+    if MAIL_PAGE_URL:
+        url_puente = _construir_url_pagina_correo(EMAIL_DESTINO, asunto, texto_sigo)
+        markup.add(InlineKeyboardButton(f"📱 Abrir en app de correo ({EMAIL_DESTINO})", url=url_puente))
     if SMTP_USER and SMTP_PASS:
-        markup.add(InlineKeyboardButton(f"📧 Enviar directo a {EMAIL_DESTINO}", callback_data=f"mail_{token}"))
+        markup.add(InlineKeyboardButton(f"📧 Enviar directo por SMTP a {EMAIL_DESTINO}", callback_data=f"mail_{token}"))
 
     bot.send_message(
         chat_id,
-        f"✅ <b>HECHO SIGO GENERADO</b> (toca el texto para copiarlo):\n\n"
+        f"✅ <b>HECHO SIGO GENERADO:</b>\n"
+        f"<i>(Toca el recuadro para copiar el texto)</i>\n\n"
         f"<pre>{html.escape(texto_sigo)}</pre>",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=markup if (MAIL_PAGE_URL or (SMTP_USER and SMTP_PASS)) else ReplyKeyboardRemove()
     )
-    if markup.keyboard:
-        bot.send_message(chat_id, "¿Cómo lo envías?", reply_markup=markup)
 
-    sesiones_sigo.pop(chat_id, None)
+    # Si están configurados SMTP_USER y SMTP_PASS, también lo enviamos automáticamente
+    if SMTP_USER and SMTP_PASS:
+        exito, detalle = enviar_correo_smtp(asunto, texto_sigo)
+        if exito:
+            bot.send_message(chat_id, f"📨 Correo enviado automáticamente a <code>{html.escape(EMAIL_DESTINO)}</code>.", parse_mode="HTML")
+        else:
+            bot.send_message(chat_id, f"⚠️ No se pudo enviar automáticamente por SMTP ({html.escape(detalle)}). Puedes pulsar el botón o copiar el texto.", parse_mode="HTML")
 
-def construir_url_correo(asunto, cuerpo):
-    """Enlace a la página de GitHub Pages que abre tu correo con todo redactado.
-    Los datos van en el fragmento (#), que no se envía a ningún servidor."""
-    if not MAIL_PAGE_URL:
-        return None
-    payload = json.dumps({"t": EMAIL_DESTINO, "s": asunto, "b": cuerpo}, ensure_ascii=False)
-    codigo = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
-    url = f"{MAIL_PAGE_URL}#d={codigo}"
-    return url if len(url) <= 2000 else None  # límite prudente para botones de Telegram
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mail_"))
+def cb_enviar_correo(call):
+    token = call.data.split("_", 1)[1]
+    info = correos_pendientes.get(token)
+    if not info:
+        bot.answer_callback_query(call.id, "Este correo ya expiró. Genera de nuevo el SIGO.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "Enviando correo...")
+    exito, detalle = enviar_correo_smtp(info["asunto"], info["cuerpo"])
+    if exito:
+        bot.send_message(call.message.chat.id, f"📨 Correo enviado correctamente a <code>{html.escape(EMAIL_DESTINO)}</code>.", parse_mode="HTML")
+    else:
+        bot.send_message(call.message.chat.id, f"❌ Error SMTP: <code>{html.escape(detalle)}</code>", parse_mode="HTML")
 
 # ==============================================================================
-# 6. ENVÍO DIRECTO DE CORREO (SMTP) - sustituye al enlace mailto que llegaba vacío
+# 6. ENVÍO DE CORREO POR SMTP
 # ==============================================================================
-def enviar_correo(asunto, cuerpo):
+def enviar_correo_smtp(asunto, cuerpo):
+    if not SMTP_USER or not SMTP_PASS:
+        return False, "Faltan SMTP_USER o SMTP_PASS"
+
     msg = EmailMessage()
     msg["From"] = SMTP_USER
     msg["To"] = EMAIL_DESTINO
     msg["Subject"] = asunto
     msg.set_content(cuerpo)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-        s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(msg)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("mail_"))
-def callback_enviar_correo(call):
-    token = call.data.split("_", 1)[1]
-    pendiente = correos_pendientes.get(token)
-
-    if not pendiente:
-        bot.answer_callback_query(call.id, "Este correo ya no está disponible. Genera el Hecho SIGO de nuevo.", show_alert=True)
-        return
-    if not SMTP_USER or not SMTP_PASS:
-        bot.answer_callback_query(call.id, "Falta configurar SMTP_USER / SMTP_PASS en el servidor.", show_alert=True)
-        return
-
-    bot.answer_callback_query(call.id, "Enviando...")
     try:
-        enviar_correo(pendiente["asunto"], pendiente["cuerpo"])
-        correos_pendientes.pop(token, None)
-        bot.edit_message_text(
-            f"✅ Correo enviado a {EMAIL_DESTINO}\nAsunto: {pendiente['asunto']}",
-            call.message.chat.id, call.message.message_id
-        )
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as servidor:
+            servidor.starttls()
+            servidor.login(SMTP_USER, SMTP_PASS)
+            servidor.send_message(msg)
+        return True, "OK"
     except Exception as e:
-        logging.error(f"Error enviando correo: {e}")
-        bot.send_message(call.message.chat.id, f"⚠️ No se pudo enviar el correo: {e}")
+        logging.error(f"Error enviando correo SMTP: {e}")
+        return False, str(e)
 
 # ==============================================================================
-# 7. HILO DE VIGILANCIA AUTOMÁTICA
+# 7. VIGILANCIA AUTOMÁTICA Y CONTROL DE TIEMPO (GITHUB ACTIONS)
 # ==============================================================================
 def bucle_vigilancia_puerto():
     logging.info("Hilo de vigilancia portuaria iniciado...")
-    primera_pasada = PRIMERA_PASADA_SILENCIOSA
+    primera_vez = True
     while True:
         try:
             barcos = extraer_barcos_puerto()
             for b in barcos:
                 if not barco_ya_registrado(b["buque"], b["entrada"], b["muelle"]):
                     b_id = guardar_barco_bd(b)
-                    if primera_pasada:
-                        # Arranque en un servidor sin base de datos previa: se registran
-                        # los barcos que ya estaban sin avisar, para no inundar el chat.
-                        continue
-                    logging.info(f"Nuevo barco detectado y registrado: {b['buque']} ({b['entrada']})")
-                    enviar_alerta_nuevo_barco(b_id, b)
-            primera_pasada = False
+                    if primera_vez and PRIMERA_PASADA_SILENCIOSA:
+                        logging.info(f"[Silencioso] Barco inicial registrado: {b['buque']}")
+                    else:
+                        logging.info(f"Nuevo barco detectado: {b['buque']} ({b['entrada']})")
+                        enviar_alerta_nuevo_barco(b_id, b)
+            primera_vez = False
         except Exception as e:
             logging.error(f"Error en bucle de vigilancia: {e}")
+
         time.sleep(INTERVALO_COMPROBACION)
 
-def _apagar():
-    logging.info("Duración máxima alcanzada: cerrando el bot limpiamente.")
+def temporizador_apagado_limpio():
+    """Apaga el proceso limpiamente al alcanzar DURACION_MAX_MIN para dar paso al tramo2 en GitHub Actions."""
+    if DURACION_MAX_MIN <= 0:
+        return
+    logging.info(f"Temporizador activado: el bot se cerrará limpiamente en {DURACION_MAX_MIN} minutos.")
+    time.sleep(DURACION_MAX_MIN * 60)
+    logging.info("Tiempo del tramo completado. Cerrando limpiamente para dar relevo al siguiente tramo...")
     try:
         bot.stop_polling()
-    finally:
-        os._exit(0)
+    except Exception:
+        pass
+    os._exit(0)
 
 if __name__ == "__main__":
     inicializar_bd()
     configurar_menu_bot()
-    threading.Thread(target=bucle_vigilancia_puerto, daemon=True).start()
+
+    hilo_vigilancia = threading.Thread(target=bucle_vigilancia_puerto, daemon=True)
+    hilo_vigilancia.start()
+
     if DURACION_MAX_MIN > 0:
-        t = threading.Timer(DURACION_MAX_MIN * 60, _apagar)
-        t.daemon = True
-        t.start()
-        logging.info(f"El bot se cerrará solo en {DURACION_MAX_MIN} minutos.")
+        hilo_timer = threading.Thread(target=temporizador_apagado_limpio, daemon=True)
+        hilo_timer.start()
 
     logging.info("Bot de Telegram conectado y escuchando...")
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=20, long_polling_timeout=10)
